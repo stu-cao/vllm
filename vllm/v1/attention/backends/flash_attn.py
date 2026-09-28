@@ -1333,13 +1333,18 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
+            # The FA4 CuTe path converts these with leading_dim=1 and rejects
+            # the stride-0 view that .expand() yields for a shared scale.
+            # Materialize with canonical strides; .contiguous() is not enough
+            # because a (1, 1) tensor is "contiguous" under any strides.
+            fmt = torch.contiguous_format
             q_descale = (
-                layer._q_scale.expand(descale_shape)
+                layer._q_scale.expand(descale_shape).clone(memory_format=fmt)
                 if self.supports_quant_query_input
                 else None
             )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            k_descale = layer._k_scale.expand(descale_shape).clone(memory_format=fmt)
+            v_descale = layer._v_scale.expand(descale_shape).clone(memory_format=fmt)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
