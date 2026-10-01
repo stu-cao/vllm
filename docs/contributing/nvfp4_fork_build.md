@@ -16,7 +16,9 @@ the workflow to exist on the default branch before it appears in that UI.
   The build refuses reuse if native sources or build configuration changed and
   verifies packaged native binaries against that upstream wheel.
 
-The toolchain uses Python 3.12, PyTorch 2.13.0/cu130, and CUDA 13.0. The
+The toolchain uses Python 3.12, PyTorch 2.13.0/cu130, and CUDA 13.0. Kernel
+compilation pins TVM-FFI 0.1.11 and CUTLASS DSL 4.7.1 to match vLLM's runtime
+requirements. The
 FlashInfer revision and vLLM binary-parent revision are pinned in the workflow.
 Each artifact records resolved versions and source/binary hashes. Dependency
 lists are recorded, not yet a fully locked or hermetic environment.

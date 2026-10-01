@@ -68,7 +68,8 @@ jobs:
           uv venv .venv --python 3.12
           uv pip install --python .venv/bin/python 'torch==2.13.0' --index-url https://download.pytorch.org/whl/cu130
           uv pip install --python .venv/bin/python 'setuptools>=77,<81' build wheel \
-            -r flashinfer-src/requirements.txt 'nvidia-cutlass-dsl[cu13]>=4.7.0a0'
+            -r flashinfer-src/requirements.txt 'apache-tvm-ffi==0.1.11' \
+            'nvidia-cutlass-dsl[cu13]==4.7.1'
       - name: Build and inspect the source wheel
         run: |
           mkdir -p artifacts/flashinfer
