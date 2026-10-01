@@ -1,0 +1,138 @@
+name: NVFP4 wheels and kernel compile cache
+
+on:
+  push:
+    branches: [ci/nvfp4-wheels-20261001]
+  workflow_dispatch:
+    inputs:
+      flashinfer_ref:
+        description: FlashInfer fork revision (resolved SHA is recorded)
+        default: 0f08cb7334d307553f82c584e1bd66bc6be8e028
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvfp4-wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLASHINFER_REF: ${{ inputs.flashinfer_ref || '0f08cb7334d307553f82c584e1bd66bc6be8e028' }}
+  VLLM_BINARY_COMMIT: 4e0a414c440e489d472a797ff1028cfc41565693
+  UV_NO_CACHE: '1'
+  UV_LINK_MODE: copy
+  MAX_JOBS: '2'
+
+jobs:
+  flashinfer:
+    if: github.repository == 'stu-cao/vllm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CUDA_HOME: /usr/local/cuda-13.0
+      FLASHINFER_CUDA_ARCH_LIST: 10.3a
+      FLASHINFER_NVCC_THREADS: '1'
+      BUILD_NVEP: '0'
+      FLASHINFER_BUILD_NO_PIP: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: stu-cao/flashinfer
+          ref: ${{ env.FLASHINFER_REF }}
+          path: flashinfer-src
+          persist-credentials: false
+      - name: Fetch only the headers needed by FlashInfer
+        working-directory: flashinfer-src
+        run: git submodule update --init --depth 1 3rdparty/cutlass 3rdparty/spdlog 3rdparty/cccl
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: 0.8.22
+          python-version: '3.12'
+          enable-cache: false
+      - name: Install CUDA compiler without a GPU driver
+        run: |
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/cuda-keyring.deb" \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i "$RUNNER_TEMP/cuda-keyring.deb"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-13-0 cuda-cudart-dev-13-0 cuda-cuobjdump-13-0
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          "$CUDA_HOME/bin/nvcc" --version
+          df -h .
+      - name: Install build and JIT dependencies
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python 'torch==2.13.0' --index-url https://download.pytorch.org/whl/cu130
+          uv pip install --python .venv/bin/python 'setuptools>=77,<81' build wheel \
+            -r flashinfer-src/requirements.txt 'nvidia-cutlass-dsl[cu13]>=4.7.0a0'
+      - name: Build and inspect the source wheel
+        run: |
+          mkdir -p artifacts/flashinfer
+          export FLASHINFER_LOCAL_VERSION="nvfp4.g$(git -C flashinfer-src rev-parse --short=12 HEAD)"
+          uv build --python .venv/bin/python --no-build-isolation --wheel \
+            --out-dir artifacts/flashinfer flashinfer-src
+          .venv/bin/python tools/nvfp4_ci.py inspect-flashinfer artifacts/flashinfer flashinfer-src
+          uv pip install --python .venv/bin/python --no-deps artifacts/flashinfer/*.whl
+      - name: Compile the installed wheel's NVFP4 kernel for both Blackwell targets
+        run: |
+          export FLASHINFER_WORKSPACE_BASE="$RUNNER_TEMP/nvfp4-jit"
+          for arch in 10.0a 10.3a; do
+            FLASHINFER_CUDA_ARCH_LIST="$arch" .venv/bin/python tools/nvfp4_ci.py \
+              compile-cache "$arch" artifacts/kernel-cache flashinfer-src
+          done
+          uv pip freeze --python .venv/bin/python > artifacts/flashinfer/build-environment.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: flashinfer-nvfp4-cu130-linux-x86_64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  vllm:
+    if: github.repository == 'stu-cao/vllm'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VLLM_USE_PRECOMPILED: '1'
+      VLLM_TARGET_DEVICE: cuda
+      VLLM_MAIN_CUDA_VERSION: '13.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Refuse reuse if native sources or their build configuration changed
+        run: |
+          git fetch --no-tags --depth 1 https://github.com/vllm-project/vllm.git "$VLLM_BINARY_COMMIT"
+          git diff --exit-code "$VLLM_BINARY_COMMIT" HEAD -- \
+            csrc cmake CMakeLists.txt rust rust-toolchain.toml .gitmodules \
+            setup.py pyproject.toml requirements tools/build_rust.py
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: 0.8.22
+          python-version: '3.12'
+          enable-cache: false
+      - name: Install matching build dependencies
+        run: |
+          uv venv .venv --python 3.12
+          uv pip install --python .venv/bin/python 'torch==2.13.0' --index-url https://download.pytorch.org/whl/cu130
+          uv pip install --python .venv/bin/python -r requirements/build/cuda.txt
+      - name: Download the pinned upstream CUDA wheel
+        run: |
+          .venv/bin/python tools/nvfp4_ci.py fetch-vllm "$VLLM_BINARY_COMMIT" "$RUNNER_TEMP/upstream.whl"
+          echo "VLLM_PRECOMPILED_WHEEL_LOCATION=$RUNNER_TEMP/upstream.whl" >> "$GITHUB_ENV"
+      - name: Build fork wheel and verify preserved native binaries
+        run: |
+          export VLLM_VERSION_OVERRIDE="0.30.1rc1.dev380+nvfp4.g${GITHUB_SHA:0:12}.cu130"
+          uv build --python .venv/bin/python --no-build-isolation --wheel --out-dir artifacts/vllm .
+          .venv/bin/python tools/nvfp4_ci.py inspect-vllm artifacts/vllm "$VLLM_PRECOMPILED_WHEEL_LOCATION"
+          uv pip freeze --python .venv/bin/python > artifacts/vllm/build-environment.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vllm-nvfp4-cu130-linux-x86_64
+          path: artifacts/vllm/
+          if-no-files-found: error
+          retention-days: 14
