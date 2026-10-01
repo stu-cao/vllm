@@ -136,21 +136,37 @@ def fetch_vllm(commit: str, destination: Path) -> None:
     print(json.dumps(metadata, indent=2), flush=True)
 
 
+def verify_native_binaries(built: zipfile.ZipFile, original: zipfile.ZipFile) -> int:
+    for required in (
+        "vllm/_C_stable_libtorch.abi3.so",
+        "vllm/_moe_C_stable_libtorch.abi3.so",
+        "vllm/vllm-rs",
+    ):
+        built.getinfo(required)
+    native_sets = [
+        {
+            name
+            for name in archive.namelist()
+            if name.endswith(".so") or name == "vllm/vllm-rs"
+        }
+        for archive in (built, original)
+    ]
+    if native_sets[0] != native_sets[1]:
+        raise RuntimeError(
+            f"Native binary inventory differs: {native_sets[0] ^ native_sets[1]}"
+        )
+    for name in sorted(native_sets[0]):
+        if built.read(name) != original.read(name):
+            raise RuntimeError(f"Native binary differs from pinned upstream: {name}")
+    return len(native_sets[0])
+
+
 def inspect_vllm(directory: Path, upstream: Path) -> None:
     wheel = single_wheel(directory)
-    native_count = 0
     with zipfile.ZipFile(wheel) as built, zipfile.ZipFile(upstream) as original:
         if built.read(VLLM_BACKEND) != Path(VLLM_BACKEND).read_bytes():
             raise RuntimeError("Fork's native NVFP4 backend was not packaged")
-        for required in ("vllm/_C.abi3.so", "vllm/vllm-rs"):
-            built.getinfo(required)
-        for name in built.namelist():
-            if name.endswith(".so") or name == "vllm/vllm-rs":
-                if built.read(name) != original.read(name):
-                    raise RuntimeError(
-                        f"Native binary differs from pinned upstream: {name}"
-                    )
-                native_count += 1
+        native_count = verify_native_binaries(built, original)
     write_manifest(
         directory,
         vllm_sha=command("git", "rev-parse", "HEAD"),
