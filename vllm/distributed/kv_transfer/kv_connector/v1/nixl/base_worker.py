@@ -132,6 +132,11 @@ class NixlBaseConnectorWorker:
     # Overridden by NixlPushConnectorWorker.
     _TRANSFER_MODE: str = "pull"
 
+    # Set in __init__; these defaults keep registration usable on workers built
+    # without it (whole-row off, no head-sharded draft).
+    _whole_row_regions: bool = False
+    _head_sharded_draft_kv_heads: int | None = None
+
     # Layer-name routing is supported only by NixlPushConnector for HMA or
     # packed KV caches under PP.
     _supports_pp_hma = False
@@ -397,25 +402,39 @@ class NixlBaseConnectorWorker:
             return None
         return draft_config.get_total_num_kv_heads()
 
+    def _is_draft_layer_name(self, layer_name: str) -> bool:
+        """Whether ``layer_name`` belongs to the speculative draft.
+
+        DFlash numbers draft layers after the target instead of prefixing them.
+        """
+        if layer_name.startswith("draft_model."):
+            return True
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is None or spec_config.draft_model_config is None:
+            return False
+        target_layers = self.model_config.get_total_num_hidden_layers()
+        draft_layers = spec_config.draft_model_config.get_total_num_hidden_layers()
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        return match is not None and (
+            target_layers <= int(match.group(1)) < target_layers + draft_layers
+        )
+
+    def _is_head_sharded_draft_layer(self, layer_name: str, is_mla: bool) -> bool:
+        """Whether a layer is a head-sharded draft layer under an MLA target."""
+        return (
+            self._head_sharded_draft_kv_heads is not None
+            and not is_mla
+            and self._is_draft_layer_name(layer_name)
+        )
+
     def _get_head_sharded_draft_regions(self) -> set[int]:
         heads = self._head_sharded_draft_kv_heads
         if heads is None:
             return set()
-        spec_config = self.vllm_config.speculative_config
-        assert spec_config is not None and spec_config.draft_model_config is not None
-        target_layers = self.model_config.get_total_num_hidden_layers()
-        draft_layers = spec_config.draft_model_config.get_total_num_hidden_layers()
         regions = set[int]()
         for i, name in enumerate(self.region_names):
-            if self._is_region_replicated(i):
+            if self._is_region_replicated(i) or not self._is_draft_layer_name(name):
                 continue
-            # DFlash numbers draft layers after the target instead of prefixing them.
-            if not name.startswith("draft_model."):
-                match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
-                if match is None or not (
-                    target_layers <= int(match.group(1)) < target_layers + draft_layers
-                ):
-                    continue
             spec = self._layer_specs[name]
             assert isinstance(spec, AttentionSpec) and spec.num_kv_heads <= heads, (
                 f"Draft region {name!r} is inconsistent with {heads} total KV heads"
@@ -632,6 +651,19 @@ class NixlBaseConnectorWorker:
         self._bidirectional_kv_xfer_enabled: bool = (
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "bidirectional_kv_xfer", False
+            )
+        )
+        # Block-major packed caches can move a block as one descriptor covering
+        # the complete storage row. Per-layer regions stay the default whenever
+        # a layer's page is contiguous, because a HiSparse decoder lands
+        # host-resident and device-only layers in different memory and must
+        # address them separately. Only replicated (MLA) layers join the row; a
+        # head-sharded draft keeps per-layer regions so each rank reads its head
+        # slice. Both P and D must set it or the handshake rejects the region
+        # count.
+        self._whole_row_regions = bool(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "whole_row_regions", False
             )
         )
 
@@ -1502,6 +1534,18 @@ class NixlBaseConnectorWorker:
                 "NIXL host staging does not preserve CSA-linear shared tensors."
             )
 
+        if self._whole_row_regions and (
+            self.use_host_buffer
+            or any(
+                group.host_resident for group in self.kv_cache_config.transfer_groups
+            )
+        ):
+            raise ValueError(
+                "whole_row_regions requires device-resident KV caches; it cannot "
+                "be combined with kv_buffer_device=cpu or host-resident transfer "
+                "groups."
+            )
+
         if self.use_host_buffer:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
@@ -1603,6 +1647,9 @@ class NixlBaseConnectorWorker:
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
+            head_sharded_draft = self._is_head_sharded_draft_layer(
+                layer_name, is_mla_region
+            )
             logger.debug(
                 "Registering layer %s with cache shape: %s", layer_name, cache.shape
             )
@@ -1688,12 +1735,24 @@ class NixlBaseConnectorWorker:
                     offset = cache.data_ptr() - storage_addr
                     assert offset >= 0 and offset + physical_page_size <= block_stride
                     packed_member_layouts[layer_name] = (offset, physical_page_size)
-                elif storage_is_block_major and (
-                    not page_contiguous
-                    and ((packed_storage and is_mla_region) or not self._is_csa_linear)
+                elif (
+                    storage_is_block_major
+                    and not head_sharded_draft
+                    and (
+                        (
+                            not page_contiguous
+                            and (
+                                (packed_storage and is_mla_region)
+                                or not self._is_csa_linear
+                            )
+                        )
+                        or (self._whole_row_regions and is_mla_region)
+                    )
                 ):
                     # TODO(Lucas): handle TP slicing for packed_storage; for now
-                    # restrict to MLA (DSv4) where kv is replicated.
+                    # restrict to MLA (DSv4) where kv is replicated. A head-sharded
+                    # draft page must stay its own region so each rank can read its
+                    # head slice.
                     # The complete storage row is one block stride. Dividing the
                     # registered length instead would fold the padding tail in.
                     storage_block_len = block_stride
