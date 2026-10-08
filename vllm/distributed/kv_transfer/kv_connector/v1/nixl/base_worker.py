@@ -1591,6 +1591,25 @@ class NixlBaseConnectorWorker:
         ):
             raise NotImplementedError("PP push with packed KV caches requires MLA")
 
+        # A whole row of a group that also holds head-sharded draft pages would
+        # carry TP-dependent bytes, so P and D rows could not match.
+        sharded_row_groups: set[int] = set()
+        if self._whole_row_regions:
+            group_by_layer = self.kv_cache_config.transfer_group_index_by_layer
+            sharded_row_groups = {
+                group_by_layer[name]
+                for name in xfer_buffers
+                if name in group_by_layer
+                and name in self._layer_specs
+                and self._is_head_sharded_draft_layer(
+                    name,
+                    isinstance(
+                        self._layer_specs[name],
+                        (MLAAttentionSpec, SlidingWindowMLASpec),
+                    ),
+                )
+            }
+
         track_region_layers = self._tracks_region_layers()
         region_layers: list[list[str]] = []
         packed_member_layouts: dict[str, tuple[int, int]] = {}
@@ -1719,6 +1738,20 @@ class NixlBaseConnectorWorker:
                     and storage_is_block_major
                     and is_mla_region
                 )
+                if (
+                    storage_is_block_major
+                    and self._whole_row_regions
+                    and is_mla_region
+                    and group_id in sharded_row_groups
+                ):
+                    raise ValueError(
+                        "whole_row_regions cannot register a block row that also "
+                        f"holds head-sharded draft pages (layer {layer_name}, group "
+                        f"{group_id}): the row size depends on the TP size, so P and "
+                        "D rows would differ. Keep the draft in its own KV cache "
+                        "group (do not combine with "
+                        "--disable-hybrid-kv-cache-manager) or drop the flag."
+                    )
                 if packed_mla and use_layer_name_routing:
                     # PP>1 prefill stage: register only this layer's page of each row.
                     region_specs = [
