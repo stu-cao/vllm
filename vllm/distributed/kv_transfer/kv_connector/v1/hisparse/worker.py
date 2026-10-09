@@ -759,10 +759,7 @@ class HiSparseConnectorWorker:
         self._record_transfer_completion(transfers, stream=current_stream())
 
     def _submit_transfers(self, transfers: list[SparseKVPageTransfer]) -> None:
-        if self.cache_handles[0].runtime.eager_host_mirror:
-            self._record_transfer_completion(transfers)
-        else:
-            self._enqueue_transfers(transfers)
+        self._enqueue_transfers(transfers)
 
     def _enqueue_transfers(self, transfers: list[SparseKVPageTransfer]) -> None:
         if not transfers or not self.is_host_writer:
