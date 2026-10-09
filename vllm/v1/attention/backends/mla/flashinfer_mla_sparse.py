@@ -598,7 +598,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 f"{FP8_STAGING_PAGE_SIZE}, got {topk_width}"
             )
         self._nvfp4_max_decode_tokens = nvfp4_fp8_max_decode_tokens(vllm_config)
-        self._nvfp4_native_decode = self._supports_native_nvfp4_decode(topk_width)
+        # HiSparse decodes from swapped-in rows of its hot slab through the FP8
+        # staging; the native kernel is not validated on that slab.
+        self._nvfp4_native_decode = (
+            vllm_config.attention_config.hisparse_config is None
+            and self._supports_native_nvfp4_decode(topk_width)
+        )
         if self._nvfp4_native_decode:
             logger.info_once(
                 "FLASHINFER_MLA_SPARSE decodes nvfp4_ds_mla with FlashInfer's native "
@@ -667,7 +672,15 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         self._prepare_mqa_kernel(layer, q.device)
 
+        index_group = self.index_group
         if self.use_nvfp4_gather:
+            if isinstance(index_group, HiSparseMLAIndexGroup):
+                return (
+                    self._forward_mqa_nvfp4_hisparse(
+                        q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                    ),
+                    None,
+                )
             return (
                 self._forward_mqa_nvfp4(
                     q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
@@ -675,7 +688,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 None,
             )
 
-        index_group = self.index_group
         if isinstance(index_group, HiSparseMLAIndexGroup):
             num_decode_tokens = attn_metadata.num_decode_tokens
             decode_out: torch.Tensor | None = None
@@ -855,6 +867,18 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 out=out,
             )
             return
+        self._nvfp4_decode_from_rows(q, kv_cache, physical_topk, valid_counts, out)
+
+    def _nvfp4_decode_from_rows(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        physical_topk: torch.Tensor,
+        valid_counts: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Stage the top-k rows of ``kv_cache`` as FP8 and run the fp8 kernel."""
+        assert self._nvfp4_inv_k_scale is not None
         topk = physical_topk.shape[1]
         step = self._nvfp4_max_decode_tokens
         for start in range(0, q.shape[0], step):
@@ -876,6 +900,77 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 output=out[start:end],
             )
 
+    def _forward_mqa_nvfp4_hisparse(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Attend over a HiSparse nvfp4_ds_mla cache through FP8 staging rows.
+
+        Decode tokens swap their top-k rows into the hot slab and stage them
+        from there (never the native kernel; see _init_nvfp4_staging). Prefill
+        tokens stage their contexts from the host pool into 352 B rows, which
+        the context gather then dequantizes into the FP8 workspace.
+        """
+        if q.dtype != current_platform.fp8_dtype():
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE runs the nvfp4_ds_mla kv-cache dtype with "
+                f"an fp8 query (quantized by the MLA layer), got {q.dtype}"
+            )
+        index_group = self.index_group
+        assert isinstance(index_group, HiSparseMLAIndexGroup)
+        assert not self._nvfp4_native_decode
+        num_tokens = q.shape[0]
+        num_decode_tokens = min(attn_metadata.num_decode_tokens, num_tokens)
+        out = torch.empty(
+            (num_tokens, q.shape[1], self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        if num_decode_tokens > 0:
+            physical_topk, valid_counts = index_group.convert_logical_to_physical_topk(
+                self.index_group_index,
+                topk_indices[:num_decode_tokens],
+                attn_metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+            self._nvfp4_decode_from_rows(
+                q[:num_decode_tokens],
+                self._nvfp4_hot_rows(index_group),
+                physical_topk,
+                valid_counts,
+                out[:num_decode_tokens],
+            )
+        if num_tokens > num_decode_tokens:
+            staged_cache, staging_block_table, _ = index_group.stage_prefill_rows(
+                self.index_group_index, kv_cache, attn_metadata
+            )
+            self._nvfp4_prefill(
+                q[num_decode_tokens:],
+                staged_cache,
+                topk_indices[num_decode_tokens:],
+                attn_metadata,
+                out[num_decode_tokens:],
+                token_offset=num_decode_tokens,
+                staging_block_table=staging_block_table,
+            )
+        return out
+
+    def _nvfp4_hot_rows(self, index_group: HiSparseMLAIndexGroup) -> torch.Tensor:
+        """This layer's HiSparse hot slab, checked for flat-row addressing."""
+        hot = index_group.physical_kv_cache(self.index_group_index)
+        # The staging gather reads physical row i at byte i * 352 of the view.
+        # HiSparse's attention view is flat-row addressed when it is contiguous;
+        # its strided fallback view (block_size rows per block) is not.
+        assert hot.is_contiguous(), (
+            "nvfp4_ds_mla HiSparse staging needs a layer-compact hot slab, got "
+            f"strides {hot.stride()}"
+        )
+        return hot
+
     def _nvfp4_prefill(
         self,
         q: torch.Tensor,
@@ -884,7 +979,14 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         attn_metadata: FlashInferMLASparseMetadata,
         out: torch.Tensor,
         token_offset: int,
+        staging_block_table: torch.Tensor | None = None,
     ) -> None:
+        """Dequantize prefill contexts into the FP8 workspace and attend.
+
+        ``staging_block_table`` (HiSparse) replaces the batch block table: one
+        row per prefill request, addressing the blocks of the staged
+        ``kv_cache``.
+        """
         assert self._nvfp4_inv_k_scale is not None
         plan = attn_metadata.nvfp4_prefill
         if plan is None:
@@ -912,10 +1014,19 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         )
         workspace = self._nvfp4_prefill_rows
         workspace_pages = workspace.view(-1, FP8_STAGING_PAGE_SIZE, FP8_STAGING_ROW_DIM)
+        chunk_req_start = 0
         for chunk in plan.chunks:
+            chunk_block_table = chunk.block_table
+            if staging_block_table is not None:
+                # Chunks cover consecutive prefill requests in order.
+                num_chunk_reqs = chunk_block_table.shape[0]
+                chunk_block_table = staging_block_table[
+                    chunk_req_start : chunk_req_start + num_chunk_reqs
+                ]
+                chunk_req_start += num_chunk_reqs
             gather_nvfp4_ds_mla_context_to_fp8(
                 kv_cache,
-                chunk.block_table,
+                chunk_block_table,
                 chunk.workspace_starts,
                 chunk.num_rows,
                 chunk.search_steps,
@@ -969,6 +1080,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype)
             else kv_cache.dtype
         )
+        if self.use_nvfp4_gather:
+            self._autotune_hisparse_nvfp4_decode(q_dtype, num_tokens, topk_tokens)
+            return
         q = torch.zeros(
             (
                 num_tokens,
@@ -994,6 +1108,41 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             device=kv_cache.device,
         )
         self._run_mqa_kernel(q, kv_cache, topk_indices, seq_lens)
+
+    def _autotune_hisparse_nvfp4_decode(
+        self, q_dtype: torch.dtype, max_num_reqs: int, topk_tokens: int
+    ) -> None:
+        """Autotune the FP8 kernel on the staged rows HiSparse decode feeds it.
+
+        The hot slab holds 352 B nvfp4_ds_mla records the fp8 kernel cannot
+        read, so run the decode staging path instead. It launches at most
+        ``_nvfp4_max_decode_tokens`` tokens at a time, the largest batch the
+        kernel sees.
+        """
+        assert isinstance(self.index_group, HiSparseMLAIndexGroup)
+        hot = self._nvfp4_hot_rows(self.index_group)
+        num_tokens = min(max_num_reqs, self._nvfp4_max_decode_tokens)
+        q = torch.zeros(
+            (num_tokens, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=q_dtype,
+            device=hot.device,
+        )
+        # The slab is cold at autotune time: cycle over its rows so the gather
+        # stays in bounds (the values do not matter for tuning).
+        hot_rows = hot.shape[0] * hot.shape[1]
+        physical_topk = (
+            torch.arange(num_tokens * topk_tokens, dtype=torch.int32, device=hot.device)
+            % hot_rows
+        ).view(num_tokens, topk_tokens)
+        valid_counts = torch.full(
+            (num_tokens,), topk_tokens, dtype=torch.int32, device=hot.device
+        )
+        out = torch.empty(
+            (num_tokens, self.num_heads, self.kv_lora_rank),
+            dtype=torch.bfloat16,
+            device=hot.device,
+        )
+        self._nvfp4_decode_from_rows(q, hot, physical_topk, valid_counts, out)
 
     def _run_mqa_kernel(
         self,
