@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_DISPATCH_ENABLE_PDL: bool | None = None
+    VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1782,6 +1783,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISPATCH_ENABLE_PDL": lambda: maybe_convert_bool(
         os.getenv("VLLM_DISPATCH_ENABLE_PDL")
     ),
+    # If set, the boot FlashInfer autotune also profiles the DP-padded MoE
+    # buckets (up to max_num_batched_tokens * dp_size rows, the row count
+    # the experts see behind an EP all-to-all), sets the
+    # FLASHINFER_AUTOTUNE_MEM_PROBE* variables for those buckets, and skips
+    # an autotune pass that hits a device OOM when world_size == 1. Costs
+    # boot time and autotune-window memory; off by default.
+    "VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS", "0"))
+    ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
@@ -2354,6 +2364,9 @@ def compile_factors() -> dict[str, object]:
         # Launch attribute of the all-to-all dispatch kernel; not part of any
         # compiled graph.
         "VLLM_DISPATCH_ENABLE_PDL",
+        # Only adds autotune buckets to the (additive) autotune cache; keeping
+        # it out of the hash lets enabling it reuse the existing cache file.
+        "VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
