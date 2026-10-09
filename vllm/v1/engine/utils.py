@@ -1389,8 +1389,13 @@ def wait_for_engine_startup(
                     f"dp lb mode"
                 )
 
-        if status == "HELLO" and engine.state == CoreEngineState.NEW:
-            # Send init message with DP config info.
+        if status == "HELLO" and engine.state in (
+            CoreEngineState.NEW,
+            CoreEngineState.CONNECTED,
+        ):
+            # Send init message with DP config info. It depends only on
+            # launch.addresses and parallel_config, never on the engine
+            # state, so a repeated HELLO is answered with the same message.
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
                     addresses=launch.addresses,
@@ -1408,9 +1413,22 @@ def wait_for_engine_startup(
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
-            conn_pending[0 if local else 1] -= 1
-            start_pending[0 if local else 1] += 1
-            engine.state = CoreEngineState.CONNECTED
+            if engine.state == CoreEngineState.NEW:
+                conn_pending[0 if local else 1] -= 1
+                start_pending[0 if local else 1] += 1
+                engine.state = CoreEngineState.CONNECTED
+            else:
+                # The engine re-ran its startup handshake after we had
+                # already moved it to CONNECTED (seen on DP ranks whose
+                # first boot runs a long FlashInfer autotune). Its first
+                # HELLO already updated the pending counters, so only
+                # resend the init message.
+                logger.warning(
+                    "idempotent re-HELLO ack for %s engine %d (already "
+                    "CONNECTED); resending the init message.",
+                    "local" if local else "remote",
+                    eng_index,
+                )
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
             # Validate config hash consistency across DP workers for MoE models.
             if coordinated_dp:
