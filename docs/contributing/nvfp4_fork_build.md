@@ -35,7 +35,7 @@ binary parent; do not bypass the source-diff guard or use an unrelated wheel.
 Download the two artifacts into the same directory:
 
 ```bash
-gh run download RUN_ID --repo stu-cao/vllm --dir nvfp4-build
+gh run download RUN_ID --repo PrimeIntellect-ai/vllm-prod --dir nvfp4-build
 uv venv --python 3.12 .venv-nvfp4
 uv pip install --python .venv-nvfp4/bin/python 'torch==2.13.0' \
   --index-url https://download.pytorch.org/whl/cu130

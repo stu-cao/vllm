@@ -12,7 +12,7 @@ on:
     inputs:
       flashinfer_ref:
         description: FlashInfer fork revision (resolved SHA is recorded)
-        default: 0f08cb7334d307553f82c584e1bd66bc6be8e028
+        default: 3a20f1368996228ca8eae68994148c5f8db67c1c
         required: true
 
 permissions:
@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FLASHINFER_REF: ${{ inputs.flashinfer_ref || '0f08cb7334d307553f82c584e1bd66bc6be8e028' }}
+  FLASHINFER_REF: ${{ inputs.flashinfer_ref || '3a20f1368996228ca8eae68994148c5f8db67c1c' }}
   # v0.31.0: the release whose native binaries the Python-only wheel reuses.
   VLLM_BINARY_COMMIT: db9527a46873454610df6dbedf79a36d6bf1a7f6
   VLLM_BINARY_VERSION: 0.31.0
@@ -33,7 +33,7 @@ env:
 
 jobs:
   flashinfer:
-    if: github.repository == 'stu-cao/vllm'
+    if: github.repository == 'PrimeIntellect-ai/vllm-prod'
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +111,7 @@ jobs:
           retention-days: 14
 
   vllm:
-    if: github.repository == 'stu-cao/vllm'
+    if: github.repository == 'PrimeIntellect-ai/vllm-prod'
     strategy:
       fail-fast: false
       matrix:
