@@ -1334,12 +1334,12 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = (
-                layer._q_scale.expand(descale_shape)
+                layer._q_scale.expand(descale_shape).clone(memory_format=torch.contiguous_format)
                 if self.supports_quant_query_input
                 else None
             )
-            k_descale = layer._k_scale.expand(descale_shape)
-            v_descale = layer._v_scale.expand(descale_shape)
+            k_descale = layer._k_scale.expand(descale_shape).clone(memory_format=torch.contiguous_format)
+            v_descale = layer._v_scale.expand(descale_shape).clone(memory_format=torch.contiguous_format)
 
             if self.dcp_world_size > 1:
                 self._forward_with_dcp(
