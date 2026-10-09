@@ -323,16 +323,34 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         block_table = plan.block_table[request_start : request_start + batch_size]
         prefill_stream.wait_stream(current_stream())
         with prefill_stream:
-            ops.cp_gather_and_upconvert_fp8_kv_cache(
-                cache.view.cache,
-                dst,
-                block_table,
-                workspace_starts,
-                batch_size,
-                host_cache=source_cache.view(-1, row_width),
-                host_row_ids=plan.row_ids,
-                device_row_ids=plan.gpu_row_ids,
-            )
+            if cache.view.cache.shape[-1] == NVFP4_DS_MLA_ROW_BYTES:
+                # The fp8 kernel reads 656 B rows, so it would misread the
+                # 352 B nvfp4_ds_mla records. Stage the plan's rows first
+                # (byte copies; resident pages device-to-device), then upconvert
+                # the staged blocks, which the plan's block table addresses.
+                staged = cache.runtime.gather_prefill_cache(
+                    source_cache.view(torch.uint8),
+                    plan,
+                    resident_cache=cache.view.cache,
+                )
+                ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+                    staged,
+                    dst,
+                    block_table,
+                    workspace_starts,
+                    batch_size,
+                )
+            else:
+                ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    cache.view.cache,
+                    dst,
+                    block_table,
+                    workspace_starts,
+                    batch_size,
+                    host_cache=source_cache.view(-1, row_width),
+                    host_row_ids=plan.row_ids,
+                    device_row_ids=plan.gpu_row_ids,
+                )
             ready = self.prefill_ready_events[layer_index]
             ready.record(prefill_stream)
         return ready
