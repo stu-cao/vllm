@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -124,6 +125,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
+            enable_pdl=os.environ.get('VLLM_DISPATCH_ENABLE_PDL', '0') == '1',
         )
         if dispatch_x_sf is not None:
             recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads
