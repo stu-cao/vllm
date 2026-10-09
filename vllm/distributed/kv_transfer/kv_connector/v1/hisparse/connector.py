@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from time import perf_counter_ns
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -30,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -43,6 +46,19 @@ if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+# Opt-in, read once at import. With neither set, the scheduler runs the full
+# context residency scan every step, as upstream does.
+# VLLM_HISPARSE_SKIP_SINGLE_TOKEN_SCAN=1 skips the scan when every scheduled
+# request is a one-token decode step; VLLM_HISPARSE_SCAN_PROFILE=1 logs the
+# scan's cost every 10 s.
+_HISPARSE_SCAN_PROFILE = os.environ.get("VLLM_HISPARSE_SCAN_PROFILE", "0") == "1"
+_HISPARSE_SKIP_SINGLE_TOKEN_SCAN = (
+    os.environ.get("VLLM_HISPARSE_SKIP_SINGLE_TOKEN_SCAN", "0") == "1"
+)
+_SCAN_PROFILE_LOG_INTERVAL_NS = 10_000_000_000
 
 
 @dataclass
@@ -94,6 +110,7 @@ class HiSparseConnectorScheduler:
         self.async_speculative = async_speculative
         self.draft_kv_lookahead = draft_kv_lookahead
         self.requests: dict[str, Request] = {}
+        self._residency_scan_profile: dict[str, int] | None = None
 
     def bind_coordinator(self, coordinator: HiSparseCoordinator) -> None:
         assert self.coordinator is None
@@ -166,8 +183,89 @@ class HiSparseConnectorScheduler:
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
-            self.coordinator.all_context_pages_resident(scheduled_requests),
+            self._context_residency_for_metadata(scheduled_requests),
         )
+
+    def _context_residency_for_metadata(
+        self, scheduled_requests: tuple[tuple[str, int, int], ...]
+    ) -> bool:
+        assert self.coordinator is not None
+        if not (_HISPARSE_SCAN_PROFILE or _HISPARSE_SKIP_SINGLE_TOKEN_SCAN):
+            return self.coordinator.all_context_pages_resident(scheduled_requests)
+
+        # The residency flag only gates pure-prefill batches: sparse MLA treats
+        # a one-token query as decode, and decode never reads the flag. False
+        # never claims missing KV is resident, so skipping the scan is safe.
+        single_token = (
+            bool(scheduled_requests)
+            and not self.async_speculative
+            and self.draft_kv_lookahead == 0
+            and all(count == 1 for _, _, count in scheduled_requests)
+        )
+        skip = _HISPARSE_SKIP_SINGLE_TOKEN_SCAN and single_token
+        start = perf_counter_ns() if _HISPARSE_SCAN_PROFILE else 0
+        result = (
+            False
+            if skip
+            else self.coordinator.all_context_pages_resident(scheduled_requests)
+        )
+        if _HISPARSE_SCAN_PROFILE:
+            self._record_scan_profile(
+                perf_counter_ns(),
+                start,
+                result=result,
+                single_token=single_token,
+                skipped=skip,
+                num_requests=len(scheduled_requests),
+            )
+        return result
+
+    def _record_scan_profile(
+        self,
+        now: int,
+        start: int,
+        *,
+        result: bool,
+        single_token: bool,
+        skipped: bool,
+        num_requests: int,
+    ) -> None:
+        elapsed = now - start
+        stats = self._residency_scan_profile
+        if stats is None:
+            stats = self._residency_scan_profile = {
+                "calls": 0,
+                "resident": 0,
+                "single_token": 0,
+                "skipped": 0,
+                "elapsed_ns": 0,
+                "max_ns": 0,
+                "requests": 0,
+                "next_log_ns": now + _SCAN_PROFILE_LOG_INTERVAL_NS,
+            }
+        stats["calls"] += 1
+        stats["resident"] += int(result)
+        stats["single_token"] += int(single_token)
+        stats["skipped"] += int(skipped)
+        stats["elapsed_ns"] += elapsed
+        stats["max_ns"] = max(stats["max_ns"], elapsed)
+        stats["requests"] += num_requests
+        if now < stats["next_log_ns"]:
+            return
+        logger.info(
+            "HiSparse residency scan profile: calls=%d true=%d "
+            "single_token=%d skipped=%d avg_ms=%.3f max_ms=%.3f "
+            "mean_reqs=%.2f total_ms=%.3f",
+            stats["calls"],
+            stats["resident"],
+            stats["single_token"],
+            stats["skipped"],
+            stats["elapsed_ns"] / stats["calls"] / 1e6,
+            stats["max_ns"] / 1e6,
+            stats["requests"] / stats["calls"],
+            stats["elapsed_ns"] / 1e6,
+        )
+        self._residency_scan_profile = None
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self.coordinator is not None

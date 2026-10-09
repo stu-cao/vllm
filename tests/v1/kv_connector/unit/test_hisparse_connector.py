@@ -14,6 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.example_connector import (
     ExampleConnector,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
+    connector as connector_module,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
     worker as worker_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
@@ -58,6 +61,52 @@ def test_cache_manager_binding_preserves_hisparse_and_legacy_pool_hooks(nested):
 
     assert hisparse.connector_scheduler.coordinator is get_hisparse_coordinator(manager)
     legacy.bind_gpu_block_pool.assert_called_once_with(manager.block_pool)
+
+
+@pytest.mark.parametrize("skip_enabled", [False, True])
+@pytest.mark.parametrize("profile_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("counts", "async_speculative", "lookahead", "single_token"),
+    [
+        ((1, 1), False, 0, True),
+        ((1, 2), False, 0, False),
+        ((), False, 0, False),
+        ((1,), True, 0, False),
+        ((1,), False, 1, False),
+    ],
+)
+def test_residency_scan_skips_only_opted_in_single_token_steps(
+    monkeypatch,
+    skip_enabled,
+    profile_enabled,
+    counts,
+    async_speculative,
+    lookahead,
+    single_token,
+):
+    """The opt-in bypass reports non-resident instead of scanning decode steps."""
+    monkeypatch.setattr(
+        connector_module, "_HISPARSE_SKIP_SINGLE_TOKEN_SCAN", skip_enabled
+    )
+    monkeypatch.setattr(connector_module, "_HISPARSE_SCAN_PROFILE", profile_enabled)
+    scheduler = HiSparseConnectorScheduler(
+        async_speculative=async_speculative, draft_kv_lookahead=lookahead
+    )
+    scheduler.coordinator = MagicMock()
+    scheduler.coordinator.all_context_pages_resident.return_value = True
+    requests = tuple((f"r{i}", 64, count) for i, count in enumerate(counts))
+
+    resident = scheduler._context_residency_for_metadata(requests)
+
+    skipped = skip_enabled and single_token
+    assert resident is not skipped
+    assert scheduler.coordinator.all_context_pages_resident.call_count == int(
+        not skipped
+    )
+    if profile_enabled:
+        assert scheduler._residency_scan_profile["skipped"] == int(skipped)
+    else:
+        assert scheduler._residency_scan_profile is None
 
 
 def test_hisparse_requires_block_outermost_device_layout():
