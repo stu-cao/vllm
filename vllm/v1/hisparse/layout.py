@@ -3,6 +3,7 @@
 
 from collections import defaultdict
 from dataclasses import dataclass
+from math import lcm
 from typing import cast
 
 from vllm.config import VllmConfig
@@ -150,6 +151,14 @@ def _lay_out_hisparse_groups(
     )
 
     indexer_page = sum(spec.page_size_bytes for spec in indexer_specs.values())
+    # The shared pool already rounds its physical block stride up to the
+    # hot-page alignment (see _get_kv_cache_bytes_per_block). Pack complete
+    # index groups into that padded space too: the raw indexer size can fall
+    # just below two such groups.
+    hot_page_alignment = lcm(*(spec.page_size_bytes for spec in source_specs.values()))
+    resident_group_page_budget = (
+        cdiv(indexer_page, hot_page_alignment) * hot_page_alignment
+    )
     hot_blocks_per_request = cdiv(config.device_buffer_size, gpu_block_size)
     hot_units: list[list[tuple[str, MLAAttentionSpec]]] = []
     for layer_name, layer_spec in source_specs.items():
@@ -198,7 +207,7 @@ def _lay_out_hisparse_groups(
     current_page = 0
     for unit in hot_units:
         unit_page = sum(spec.page_size_bytes for _, spec in unit)
-        if current and current_page + unit_page > indexer_page:
+        if current and current_page + unit_page > resident_group_page_budget:
             append_hot_group(current)
             current = []
             current_page = 0

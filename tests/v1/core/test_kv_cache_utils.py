@@ -240,6 +240,58 @@ def test_hisparse_host_pool_must_fit_max_model_len(monkeypatch, extra_blocks, ok
             create_hisparse_layout(config, groups, host_budget=host_budget)
 
 
+def test_hisparse_resident_groups_fill_the_padded_block_stride(monkeypatch):
+    """The shared pool pads a block to the hot-page alignment anyway, so
+    resident groups may fill that padding, not just the raw indexer pages."""
+    monkeypatch.setattr(
+        hisparse_runtime_module.current_platform, "is_cuda_alike", lambda: True
+    )
+    specs: dict[str, KVCacheSpec] = {}
+    for i in range(2):
+        specs[f"model.layers.{i}.self_attn"] = MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            is_index_group_leader=True,
+        )
+        specs[f"model.layers.{i}.self_attn.indexer"] = MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            cache_role=SparseCacheRole.INDEXER,
+        )
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=HiSparseConfig()),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(index_topk=128), max_model_len=64 * 4
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, world_size=1),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=7),
+    )
+    source_page = specs["model.layers.0.self_attn"].page_size_bytes
+    indexer_page = 2 * specs["model.layers.0.self_attn.indexer"].page_size_bytes
+    # Two source pages overflow the raw indexer pages but fit their padding.
+    assert source_page < indexer_page < 2 * source_page
+
+    groups = get_hisparse_kv_cache_groups(config, specs)
+
+    assert groups is not None
+    assert [
+        group.layer_names
+        for group in groups
+        if isinstance(group.kv_cache_spec, HiSparseResidentSpec)
+    ] == [
+        [
+            "model.layers.0.self_attn.hisparse_resident",
+            "model.layers.1.self_attn.hisparse_resident",
+        ]
+    ]
+    bytes_per_block = kv_cache_utils._get_kv_cache_bytes_per_block(groups[1:])
+    assert bytes_per_block == 2 * source_page
+
+
 @pytest.mark.parametrize(
     "max_model_len,num_gpu_blocks,ok",
     [
