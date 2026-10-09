@@ -4,10 +4,21 @@
 
 from __future__ import annotations
 
+import os
+from time import perf_counter_ns
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+from vllm.logger import init_logger
+
+_HISPARSE_SCAN_PROFILE = os.environ.get("VLLM_HISPARSE_SCAN_PROFILE", "0") == "1"
+_HISPARSE_SKIP_SINGLE_TOKEN_SCAN = (
+    os.environ.get("VLLM_HISPARSE_SKIP_SINGLE_TOKEN_SCAN", "0") == "1"
+)
+_scan_logger = init_logger(__name__)
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -166,8 +177,63 @@ class HiSparseConnectorScheduler:
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
-            self.coordinator.all_context_pages_resident(scheduled_requests),
+            self._context_residency_for_metadata(scheduled_requests),
         )
+
+    def _context_residency_for_metadata(
+        self, scheduled_requests: tuple[tuple[str, int, int], ...]
+    ) -> bool:
+        assert self.coordinator is not None
+        if not (_HISPARSE_SCAN_PROFILE or _HISPARSE_SKIP_SINGLE_TOKEN_SCAN):
+            return self.coordinator.all_context_pages_resident(scheduled_requests)
+
+        # Conservative experimental fast path, independently gated from profiling.
+        # Sparse MLA classifies one-token queries as decode. Its decode path does
+        # not need this prefill-only gate. False cannot claim missing KV resident.
+        single_token = (
+            bool(scheduled_requests)
+            and not self.async_speculative
+            and self.draft_kv_lookahead == 0
+            and all(count == 1 for _, _, count in scheduled_requests)
+        )
+        skip = _HISPARSE_SKIP_SINGLE_TOKEN_SCAN and single_token
+        start = perf_counter_ns() if _HISPARSE_SCAN_PROFILE else 0
+        result = (
+            False
+            if skip
+            else self.coordinator.all_context_pages_resident(scheduled_requests)
+        )
+        if not _HISPARSE_SCAN_PROFILE:
+            return result
+
+        now = perf_counter_ns()
+        elapsed = now - start
+        stats = getattr(self, "_residency_scan_profile", None)
+        if stats is None:
+            stats = self._residency_scan_profile = {
+                "calls": 0, "resident": 0, "single_token": 0, "skipped": 0,
+                "elapsed_ns": 0, "max_ns": 0, "requests": 0,
+                "next_log_ns": now + 10_000_000_000,
+            }
+        stats["calls"] += 1
+        stats["resident"] += int(result)
+        stats["single_token"] += int(single_token)
+        stats["skipped"] += int(skip)
+        stats["elapsed_ns"] += elapsed
+        stats["max_ns"] = max(stats["max_ns"], elapsed)
+        stats["requests"] += len(scheduled_requests)
+        if now >= stats["next_log_ns"]:
+            _scan_logger.info(
+                "HiSparse residency scan profile: calls=%d true=%d "
+                "single_token=%d skipped=%d avg_ms=%.3f max_ms=%.3f "
+                "mean_reqs=%.2f total_ms=%.3f",
+                stats["calls"], stats["resident"], stats["single_token"],
+                stats["skipped"], stats["elapsed_ns"] / stats["calls"] / 1e6,
+                stats["max_ns"] / 1e6, stats["requests"] / stats["calls"],
+                stats["elapsed_ns"] / 1e6,
+            )
+            self._residency_scan_profile = None
+        return result
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self.coordinator is not None
