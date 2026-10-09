@@ -401,6 +401,39 @@ class NixlBaseConnectorWorker:
         )
         return flags
 
+    def _draft_head_slice(self, meta, region, remote_region, block_size_ratio):
+        """Preserve production DFlash TP1-to-TPn draft head slicing."""
+        if os.environ.get("R32_NIXL_DFLASH_DRAFT_SLICE") != "1":
+            return None
+        spec = self.vllm_config.speculative_config
+        if spec is None or spec.method != "dflash":
+            return None
+        if self.region_names[region] not in self._dflash_draft_regions():
+            return None
+        info = self.transfer_topo.get_engine_info(meta.engine_id)
+        if info.remote_tp_size != 1:
+            return None
+        assert self.dcp_size == 1 and meta.dcp_size == 1 and meta.pcp_size == 1
+        assert self.use_mla and not self._has_mamba and not self.use_host_buffer
+        assert self.block_size == meta.block_size and block_size_ratio == 1
+        assert self.kv_cache_layout == meta.kv_cache_layout == "LBHNC"
+        assert meta.region_names[remote_region] == self.region_names[region]
+        assert not self._is_region_replicated(region)
+        heads = spec.draft_model_config.hf_config.num_key_value_heads
+        assert heads % self.world_size == 0, (heads, self.world_size)
+        local_len = self.block_len_per_layer[region]
+        assert meta.block_lens[remote_region] == local_len * self.world_size
+        assert self.block_stride_per_layer[region] == local_len
+        assert meta.block_strides[remote_region] == local_len * self.world_size
+        assert 0 <= self.tp_rank < self.world_size
+        return self.tp_rank
+
+    def _dflash_draft_regions(self):
+        spec = self.vllm_config.speculative_config
+        n = spec.draft_model_config.hf_config.num_hidden_layers
+        base = self.vllm_config.model_config.hf_config.num_hidden_layers
+        return {f"model.layers.{i}.self_attn.attn" for i in range(base, base + n)}
+
     def _is_region_replicated(self, region_idx: int) -> bool:
         """Whether region ``region_idx`` is transferred REPLICATE vs SPLIT.
 
@@ -2104,6 +2137,12 @@ class NixlBaseConnectorWorker:
             rank_offset = (
                 0 if replicated else plan.rank_offset_factor * remote_kv_block_len
             )
+            draft_slice = self._draft_head_slice(
+                nixl_agent_meta, local_region, i, block_size_ratio
+            )
+            if draft_slice is not None:
+                assert num_reads == 1
+                rank_offset = draft_slice * remote_kv_block_len
             local_block_len = local_block_len // num_reads
 
             block_arange = np.arange(region_num_blocks[i], dtype=np.uint64)
@@ -2639,7 +2678,13 @@ class NixlBaseConnectorWorker:
                 local_len = self.block_len_per_layer[region_idx]
                 replicated = model_replicated or self._is_region_replicated(region_idx)
                 remote_len = nixl_agent_meta.block_lens[i]
-                if replicated:
+                draft_slice = self._draft_head_slice(
+                    nixl_agent_meta, region_idx, i, block_size_ratio
+                )
+                if draft_slice is not None:
+                    assert remote_tp_size == 1
+                    assert remote_len == local_len * self.world_size
+                elif replicated:
                     assert local_len // block_size_ratio == remote_len, (
                         "KV cache sizes must match between P and D when "
                         f"replicated (region {i}: local={local_len}, "
