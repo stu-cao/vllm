@@ -967,6 +967,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        # Cold JIT is serialized by a node-local file lock. Do not let a rank
+        # enter an EP collective while its peers are still building MoE code.
+        if (
+            self.parallel_config.enable_expert_parallel
+            and self.parallel_config.all2all_backend == "flashinfer_nvlink_one_sided"
+            and self.cache_config.cache_dtype == "nvfp4_ds_mla"
+        ):
+            from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+            from vllm.distributed import get_ep_group
+
+            logger.info("Prefill NVFP4: loading MoE JIT before EP profiling")
+            get_trtllm_moe_sm100_module()
+            # GroupCoordinator.barrier uses Gloo/CPU, not a GPU collective.
+            logger.info("Prefill NVFP4: MoE JIT loaded; waiting for all EP ranks")
+            get_ep_group().barrier()
+            logger.info("Prefill NVFP4: all EP ranks ready for profiling")
+
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
