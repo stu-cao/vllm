@@ -2340,6 +2340,40 @@ def test_nixl_hisparse_gpu_import_pulls_into_resident_pages():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("num_regions_at_base", [1, 2])
+def test_nixl_alias_requires_one_region_at_the_source_base(num_regions_at_base):
+    """Regions dedup by (base_addr, block_len), so a base can own two regions."""
+    page = 64
+    host_cache = torch.zeros(4, page, dtype=torch.uint8)
+    resident_cache = torch.zeros(6, page, dtype=torch.uint8)
+    worker = object.__new__(NixlConnectorWorker)
+    worker._transfer_aliases = {"mla": ("mla.hisparse_resident", 1)}
+    worker.use_host_buffer = False
+    worker._has_mamba = False
+    worker.pp_size = 1
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.num_blocks = 6
+    worker.nixl_memory_type = "VRAM"
+    base_addresses = [host_cache.data_ptr()] * num_regions_at_base
+    worker.block_len_per_layer = [page, page // 2][:num_regions_at_base]
+    kv_caches = {"mla": host_cache, "mla.hisparse_resident": resident_cache}
+
+    def register():
+        return worker._register_region_aliases(
+            {"mla": host_cache}, kv_caches, base_addresses, {}
+        )
+
+    if num_regions_at_base > 1:
+        with pytest.raises(NotImplementedError, match="exactly one"):
+            register()
+        return
+    (region, alias), *_ = register().items()
+    assert region == 0
+    assert alias.base_addr == resident_cache.data_ptr()
+    assert alias.block_stride == page and alias.num_blocks == 6
+
+
+@pytest.mark.cpu_test
 def test_register_kv_caches_hybrid_mla_dual_purpose_regions():
     """Hybrid MLA+KDA registration: HMA tensors shared by both layer types
     must be flagged as MLA regions even when a KDA layer registers them

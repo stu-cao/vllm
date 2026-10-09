@@ -3164,7 +3164,17 @@ class NixlBaseConnectorWorker:
                     "NIXL alias regions require direct pure-attention transfers "
                     "at the kernel block size"
                 )
-            region = base_addresses.index(xfer_buffers[layer_name].data_ptr())
+            # Regions are keyed by (base_addr, block_len), so two regions can
+            # share a base address. Aliasing the first one could leave the
+            # pages of the other in the host region.
+            base_addr = xfer_buffers[layer_name].data_ptr()
+            regions = [i for i, addr in enumerate(base_addresses) if addr == base_addr]
+            if len(regions) != 1:
+                raise NotImplementedError(
+                    f"NIXL alias regions require {layer_name} to own exactly one "
+                    f"transfer region at its base address, found {len(regions)}"
+                )
+            (region,) = regions
             cache = kv_caches[alias_name]
             block_stride = cache.stride(0) * cache.element_size()
             if (
