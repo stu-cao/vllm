@@ -14,6 +14,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
@@ -78,6 +79,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import make_zmq_path
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.hisparse.layout import get_hisparse_resident_aliases
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -100,6 +102,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _SHARED_REGION_GROUP_ID = -1
+
+
+@dataclass
+class _RegionAlias:
+    """A local-only destination that can replace a transfer region's pages."""
+
+    group_id: int
+    layer_name: str
+    base_addr: int
+    block_stride: int
+    num_blocks: int
+    desc_offset: int = 0
 
 
 def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
@@ -661,6 +675,8 @@ class NixlBaseConnectorWorker:
         )
 
         self.kv_cache_config = kv_cache_config
+        self._transfer_aliases = get_hisparse_resident_aliases(kv_cache_config)
+        self._region_aliases: dict[int, _RegionAlias] = {}
         transfer_block_sizes = [
             group.kv_cache_spec.block_size
             for group in kv_cache_config.transfer_groups
@@ -1927,6 +1943,14 @@ class NixlBaseConnectorWorker:
                     f"kv_cache_layout={self.kv_cache_layout}"
                 )
 
+        self._region_aliases = self._register_region_aliases(
+            xfer_buffers, kv_caches, seen_base_addresses, registration_ranges
+        )
+        if self._region_aliases:
+            region_mem_types_with_aliases = {*region_mem_types, self.nixl_memory_type}
+        else:
+            region_mem_types_with_aliases = set(region_mem_types)
+
         logger.debug(
             "Different block lengths collected: %s", set(self.block_len_per_layer)
         )
@@ -1970,14 +1994,19 @@ class NixlBaseConnectorWorker:
             else self.region_num_blocks
         )
         self.num_descs = sum(xfer_region_num_blocks)
+        desc_offset = self.num_descs
+        for region in sorted(self._region_aliases):
+            alias = self._region_aliases[region]
+            alias.desc_offset = desc_offset
+            desc_offset += alias.num_blocks
 
-        self._mixed_mem_types = len(set(region_mem_types)) > 1
+        self._mixed_mem_types = len(region_mem_types_with_aliases) > 1
         if self._mixed_mem_types:
             assert self.use_mla and not self._has_mamba, (
                 "Mixed-device KV registration is only supported for MLA "
                 "models without Mamba layers."
             )
-        for mem_type in sorted(set(region_mem_types)):
+        for mem_type in sorted(region_mem_types_with_aliases):
             ranges_for_mem_type = [
                 (start, end - start, device_id, "")
                 for (_, cache_mem_type), (
@@ -2228,6 +2257,17 @@ class NixlBaseConnectorWorker:
                 + split_offsets * block_len
             )
             parts.append(self._stack_descs(addrs, block_len, device_id))
+        if block_size_ratio == 1:
+            for region in sorted(self._region_aliases):
+                alias = self._region_aliases[region]
+                addrs = alias.base_addr + alias.block_stride * np.arange(
+                    alias.num_blocks, dtype=np.uint64
+                )
+                parts.append(
+                    self._stack_descs(
+                        addrs, self.block_len_per_layer[region], device_id
+                    )
+                )
         return np.concatenate(parts)
 
     def _build_fa_remote(
@@ -2333,6 +2373,11 @@ class NixlBaseConnectorWorker:
                         self.region_num_blocks,
                         strict=True,
                     )
+                ]
+                + [
+                    np.zeros(alias.num_blocks, dtype=bool)
+                    for alias in self._region_aliases.values()
+                    if block_size_ratio == 1
                 ]
             )
             assert len(desc_is_dram) == len(blocks_data)
@@ -3096,7 +3141,74 @@ class NixlBaseConnectorWorker:
                 indices=indices,
             )
 
-    def _zero_region_blocks(self, block_ids: BlockIds) -> None:
+    def _register_region_aliases(
+        self,
+        xfer_buffers: dict[str, torch.Tensor],
+        kv_caches: dict[str, torch.Tensor],
+        base_addresses: list[int],
+        registration_ranges: dict[tuple[int, str], tuple[int, int, int]],
+    ) -> dict[int, _RegionAlias]:
+        """Register device views that may receive a transfer region's pages."""
+        aliases: dict[int, _RegionAlias] = {}
+        num_blocks = self.num_blocks
+        for layer_name, (alias_name, group_id) in self._transfer_aliases.items():
+            if layer_name not in xfer_buffers:
+                continue
+            if (
+                self.use_host_buffer
+                or self._has_mamba
+                or self._requires_layer_name_routing()
+                or self._physical_blocks_per_logical_kv_block != 1
+            ):
+                raise NotImplementedError(
+                    "NIXL alias regions require direct pure-attention transfers "
+                    "at the kernel block size"
+                )
+            region = base_addresses.index(xfer_buffers[layer_name].data_ptr())
+            cache = kv_caches[alias_name]
+            block_stride = cache.stride(0) * cache.element_size()
+            if (
+                cache.shape[0] < num_blocks
+                or block_stride < self.block_len_per_layer[region]
+            ):
+                raise ValueError(
+                    f"Alias {alias_name} cannot hold the pages of {layer_name}"
+                )
+            storage = cache.untyped_storage()
+            registration_ranges.setdefault(
+                (storage.data_ptr(), self.nixl_memory_type),
+                (
+                    storage.data_ptr(),
+                    storage.data_ptr() + storage.nbytes(),
+                    max(cache.get_device(), 0),
+                ),
+            )
+            aliases[region] = _RegionAlias(
+                group_id, alias_name, cache.data_ptr(), block_stride, num_blocks
+            )
+        return aliases
+
+    def _alias_local_desc_ids(
+        self, block_ids_by_region: BlockIds, desc_ids: np.ndarray
+    ) -> np.ndarray:
+        """Point aliased regions' region-ordered descriptor ids at their aliases."""
+        parts = []
+        start = 0
+        for region, blocks in enumerate(block_ids_by_region):
+            end = start + len(blocks)
+            alias = self._region_aliases.get(region)
+            parts.append(
+                desc_ids[start:end]
+                if alias is None
+                else alias.desc_offset + np.asarray(blocks, dtype=desc_ids.dtype)
+            )
+            start = end
+        assert start == len(desc_ids)
+        return np.concatenate(parts) if parts else desc_ids
+
+    def _zero_region_blocks(
+        self, block_ids: BlockIds, use_alias_regions: bool = False
+    ) -> None:
         """Clear clipped physical pages in their owning region only."""
         if not any(block_ids):
             return
@@ -3104,13 +3216,23 @@ class NixlBaseConnectorWorker:
         for region, blocks in enumerate(block_ids):
             if not blocks:
                 continue
-            cache = self.device_kv_caches[self.region_names[region]]
+            alias = self._region_aliases.get(region) if use_alias_regions else None
+            if alias is None:
+                cache = self.device_kv_caches[self.region_names[region]]
+                base_addr = bases[region]
+                num_blocks = self.region_num_blocks[region]
+                block_stride = self.block_stride_per_layer[region]
+            else:
+                cache = self.device_kv_caches[alias.layer_name]
+                base_addr = alias.base_addr
+                num_blocks = alias.num_blocks
+                block_stride = alias.block_stride
             storage = cache.untyped_storage()
             pages = torch.empty(0, dtype=torch.uint8, device=cache.device).set_(
                 storage,
-                bases[region] - storage.data_ptr(),
-                (self.region_num_blocks[region], self.block_len_per_layer[region]),
-                (self.block_stride_per_layer[region], 1),
+                base_addr - storage.data_ptr(),
+                (num_blocks, self.block_len_per_layer[region]),
+                (block_stride, 1),
             )
             for block in blocks:
                 pages[block].zero_()
@@ -3193,7 +3315,9 @@ class NixlBaseConnectorWorker:
             if meta.region_blocks_to_zero is not None:
                 # P/D group positions differ. Use the actual region read plan,
                 # including any local allocation padding the read did not cover.
-                self._zero_region_blocks(meta.region_blocks_to_zero)
+                self._zero_region_blocks(
+                    meta.region_blocks_to_zero, meta.alias_block_ids is not None
+                )
                 continue
 
             # Post processing for heteroblocksize/layout, and for blocks the
