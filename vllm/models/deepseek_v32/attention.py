@@ -40,6 +40,16 @@ from vllm.v1.attention.ops.pcp import (
     maybe_gather_mla_latent_cache_inputs,
 )
 
+# venv patch (patch_venv_ds32_sparse_staging.py): the nvfp4_ds_mla KV cache is
+# served through the FlashInfer sparse MLA FP8 staging installed by
+# patch_venv_fi_nvfp4_gather.py (nvfp4_ds_mla_fp8_gather). Import it here so a
+# missing backend patch fails loudly at model-load time, before any raw
+# nvfp4_ds_mla records reach an attention kernel.
+from vllm.v1.attention.backends.mla.nvfp4_ds_mla_fp8_gather import (
+    NVFP4_DS_MLA_KV_LORA_RANK,
+    NVFP4_DS_MLA_ROPE_DIM,
+)
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
     from vllm.v1.attention.backends.mla.index_group import (
@@ -224,12 +234,19 @@ class DeepseekV32Attention(MLAAttention):
         self.topk_indices_buffer = topk_indices_buffer
 
         self.skip_topk = False
+        # venv patch (patch_venv_ds32_sparse_staging.py): nvfp4_ds_mla KV is
+        # served exclusively through the backend's FP8 staging (see
+        # _sparse_indexer_and_attn), so the dense-MHA prefill route is never
+        # taken and the indexer must keep scoring top-k for the short prefill
+        # batches that route used to consume without top-k indices.
+        self._nvfp4_ds_mla_kv = self.kv_cache_dtype == "nvfp4_ds_mla"
         enable_short_prefill_scoring_skip = (
             not is_mtp_layer
             and not skip_topk
             and not self.use_pcp
             and current_platform.is_cuda()
             and self.supports_dense_mha_prefill
+            and not self._nvfp4_ds_mla_kv
         )
         self._dense_mha_metadata_layer_name = (
             self.layer_name if enable_short_prefill_scoring_skip else ""
@@ -441,6 +458,54 @@ class DeepseekV32Attention(MLAAttention):
         )
         return self.o_proj(output)[0]
 
+    def _nvfp4_sparse_kv_staging_active(
+        self, attn_metadata: "MLACommonMetadata"
+    ) -> bool:
+        """venv patch: whether this layer serves nvfp4 KV via FP8 staging.
+
+        The FlashInfer sparse MLA backend patch (patch_venv_fi_nvfp4_gather)
+        dequantizes raw nvfp4_ds_mla records into an FP8 workspace before the
+        trtllm-gen sparse kernel runs: decode tokens gather their own top-k
+        rows into the workspace, prefill tokens share one context gather per
+        request with their top-k indices remapped to workspace rows. The dense
+        full-context MHA route has no such staging: its context gather hands
+        the raw records and the "nvfp4_ds_mla" dtype string to the C++ cache
+        kernels, which assert. nvfp4 batches therefore always take the staged
+        sparse MQA path below. Refuse loudly if the staging is unavailable
+        instead of feeding raw records to the kernel.
+        """
+        if not self._nvfp4_ds_mla_kv:
+            return False
+        if (self.kv_lora_rank, self.qk_rope_head_dim) != (
+            NVFP4_DS_MLA_KV_LORA_RANK,
+            NVFP4_DS_MLA_ROPE_DIM,
+        ):
+            raise RuntimeError(
+                f"{self.layer_name}: the nvfp4_ds_mla kv-cache dtype requires "
+                f"kv_lora_rank={NVFP4_DS_MLA_KV_LORA_RANK} and "
+                f"qk_rope_head_dim={NVFP4_DS_MLA_ROPE_DIM}, got "
+                f"{self.kv_lora_rank} and {self.qk_rope_head_dim}"
+            )
+        impl = self.impl
+        if not getattr(impl, "use_nvfp4_gather", False):
+            raise RuntimeError(
+                f"{self.layer_name}: the nvfp4_ds_mla kv-cache dtype requires "
+                "the FlashInfer sparse MLA FP8 staging patch "
+                "(patch_venv_fi_nvfp4_gather); the installed attention impl "
+                f"{type(impl).__name__} has no nvfp4 FP8 staging."
+            )
+        if (
+            getattr(attn_metadata, "num_prefills", 0) > 0
+            and getattr(attn_metadata, "nvfp4_prefill", None) is None
+        ):
+            raise RuntimeError(
+                f"{self.layer_name}: nvfp4_ds_mla prefill batch reached the "
+                "sparse MQA path without an FP8 context-gather plan "
+                "(metadata.nvfp4_prefill); the FlashInfer sparse MLA staging "
+                "patch did not build one."
+            )
+        return True
+
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
         self,
@@ -529,7 +594,10 @@ class DeepseekV32Attention(MLAAttention):
             output.zero_()
             return
 
-        if self._use_sparse_mha(attn_metadata):
+        if (
+            self._use_sparse_mha(attn_metadata)
+            and not self._nvfp4_sparse_kv_staging_active(attn_metadata)
+        ):
             assert kv_c is not None and k_pe is not None
             mha_q_pe = self.rotary_emb(positions, q_pe)[0] if self._fp8_query else mqa_q
             mha_q = torch.cat((q_nope, mha_q_pe), dim=-1)
