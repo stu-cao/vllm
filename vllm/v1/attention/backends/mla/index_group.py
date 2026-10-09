@@ -423,16 +423,34 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         block_table = plan.block_table[request_start : request_start + batch_size]
         prefill_stream.wait_stream(current_stream())
         with prefill_stream:
-            ops.cp_gather_and_upconvert_fp8_kv_cache(
-                cache.view.cache,
-                dst,
-                block_table,
-                workspace_starts,
-                batch_size,
-                host_cache=source_cache.view(-1, row_width),
-                host_row_ids=plan.row_ids,
-                device_row_ids=plan.gpu_row_ids,
-            )
+            if cache.view.cache.shape[-1] * cache.view.cache.element_size() == 352:
+                # nvfp4_ds_mla rows: the fp8 kernel reads 656B per 352B row.
+                # Stage host rows byte-level, then NVFP4-gather on device.
+                staged = cache.runtime.gather_prefill_cache(
+                    source_cache.view(-1, row_width).view(torch.uint8).view(-1, 352)
+                    if row_width * source_cache.element_size() != 352
+                    else source_cache,
+                    plan,
+                    resident_cache=cache.view.cache,
+                )
+                ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+                    cache.view.cache if staged is None else staged,
+                    dst,
+                    block_table,
+                    workspace_starts,
+                    batch_size,
+                )
+            else:
+                ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    cache.view.cache,
+                    dst,
+                    block_table,
+                    workspace_starts,
+                    batch_size,
+                    host_cache=source_cache.view(-1, row_width),
+                    host_row_ids=plan.row_ids,
+                    device_row_ids=plan.gpu_row_ids,
+                )
             ready = self.prefill_ready_events[layer_index]
             ready.record(prefill_stream)
         return ready
