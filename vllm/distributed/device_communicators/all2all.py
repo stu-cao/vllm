@@ -741,6 +741,9 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         self.top_k = 0
         self.num_experts = 0
         self._combine_supports_output = False
+        # Extra keyword arguments for MoeAlltoAll.dispatch, resolved per
+        # workspace in initialize().
+        self.dispatch_kwargs: dict[str, Any] = {}
 
     def initialize(
         self,
@@ -847,6 +850,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             )
         except (TypeError, ValueError):
             self._combine_supports_output = False
+        self.dispatch_kwargs = self._resolve_dispatch_kwargs()
 
         self.gpus_per_node = gpus_per_node
         self.initialized = True
@@ -860,6 +864,44 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         # rebuild a different number of times if their MoE layers have
         # different shape sequences, so a world-level barrier would deadlock.
         dist.barrier(group=self.cpu_group)
+
+    def _resolve_dispatch_kwargs(self) -> dict[str, Any]:
+        """Apply VLLM_DISPATCH_ENABLE_PDL to the dispatch call, if set.
+
+        Unset leaves PDL to FlashInfer (on for SM90+). Stock FlashInfer
+        0.7.x exposes enable_pdl only on the standalone moe_a2a_dispatch,
+        not on MoeAlltoAll.dispatch, so forcing PDL off needs a FlashInfer
+        that forwards it; fail loudly rather than silently keep PDL on.
+        """
+        enable_pdl = envs.VLLM_DISPATCH_ENABLE_PDL
+        if enable_pdl is None:
+            return {}
+        assert self.moe_alltoall is not None
+        try:
+            supported = supports_kw(
+                self.moe_alltoall.dispatch, "enable_pdl", allow_var_kwargs=False
+            )
+        except (TypeError, ValueError):
+            supported = False
+        if supported:
+            logger.info_once(
+                "FlashInfer one-sided all-to-all dispatch: enable_pdl=%s "
+                "(VLLM_DISPATCH_ENABLE_PDL).",
+                enable_pdl,
+            )
+            return {"enable_pdl": enable_pdl}
+        if enable_pdl:
+            logger.warning_once(
+                "VLLM_DISPATCH_ENABLE_PDL=1 is ignored: this FlashInfer's "
+                "MoeAlltoAll.dispatch has no enable_pdl argument, so FlashInfer "
+                "picks the PDL default (on for SM90+)."
+            )
+            return {}
+        raise RuntimeError(
+            "VLLM_DISPATCH_ENABLE_PDL=0 needs a FlashInfer whose "
+            "MoeAlltoAll.dispatch accepts enable_pdl; the installed one does "
+            "not, so the dispatch would still launch with PDL."
+        )
 
     def combine_into(
         self,

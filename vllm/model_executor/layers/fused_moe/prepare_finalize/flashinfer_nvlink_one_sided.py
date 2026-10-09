@@ -124,6 +124,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
+            **self.all2all_manager.dispatch_kwargs,  # type: ignore[attr-defined]
         )
         if dispatch_x_sf is not None:
             recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads

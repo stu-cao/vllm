@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+    VLLM_DISPATCH_ENABLE_PDL: bool | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1772,6 +1773,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             if v.strip()
         ]
     ),
+    # Programmatic dependent launch (PDL) for the FlashInfer one-sided NVLink
+    # all-to-all dispatch (--all2all-backend flashinfer_nvlink_one_sided).
+    # Unset: FlashInfer decides (PDL on for SM90+). 1/0: force it on/off,
+    # e.g. 0 when the kernels around the MoE dispatch are not PDL-safe.
+    # Forcing it off needs a FlashInfer whose MoeAlltoAll.dispatch accepts
+    # enable_pdl.
+    "VLLM_DISPATCH_ENABLE_PDL": lambda: maybe_convert_bool(
+        os.getenv("VLLM_DISPATCH_ENABLE_PDL")
+    ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
@@ -2341,6 +2351,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        # Launch attribute of the all-to-all dispatch kernel; not part of any
+        # compiled graph.
+        "VLLM_DISPATCH_ENABLE_PDL",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

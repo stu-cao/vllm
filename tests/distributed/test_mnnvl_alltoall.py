@@ -249,6 +249,40 @@ def test_one_sided_combine_into_compatibility(supports_output):
     torch.testing.assert_close(output, payload + 2)
 
 
+@pytest.mark.parametrize("supports_pdl", [False, True])
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+def test_one_sided_dispatch_pdl_kwargs(monkeypatch, supports_pdl, env_value):
+    from vllm.distributed.device_communicators.all2all import (
+        FlashInferNVLinkOneSidedManager,
+    )
+
+    class FakeMoeAlltoAll:
+        def dispatch(self, token_selected_experts, input_payloads):
+            pass
+
+    class FakePdlMoeAlltoAll:
+        def dispatch(self, token_selected_experts, input_payloads, enable_pdl=None):
+            pass
+
+    if env_value is None:
+        monkeypatch.delenv("VLLM_DISPATCH_ENABLE_PDL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_DISPATCH_ENABLE_PDL", env_value)
+    manager = FlashInferNVLinkOneSidedManager.__new__(FlashInferNVLinkOneSidedManager)
+    manager.moe_alltoall = FakePdlMoeAlltoAll() if supports_pdl else FakeMoeAlltoAll()
+
+    if env_value is None:
+        assert manager._resolve_dispatch_kwargs() == {}
+    elif supports_pdl:
+        expected = {"enable_pdl": env_value == "1"}
+        assert manager._resolve_dispatch_kwargs() == expected
+    elif env_value == "1":
+        assert manager._resolve_dispatch_kwargs() == {}
+    else:
+        with pytest.raises(RuntimeError, match="VLLM_DISPATCH_ENABLE_PDL=0"):
+            manager._resolve_dispatch_kwargs()
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Two-sided manager lifecycle (init, cleanup, reinit, ensure_init)
 # ---------------------------------------------------------------------------
