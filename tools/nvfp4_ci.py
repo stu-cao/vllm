@@ -109,7 +109,7 @@ def compile_cache(arch: str, directory: Path, source: Path) -> None:
     )
 
 
-def fetch_vllm(commit: str, destination: Path) -> None:
+def fetch_vllm(commit: str, destination: Path, version: str | None = None) -> None:
     if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
         raise ValueError("An exact upstream commit is required")
     index = f"https://wheels.vllm.ai/{commit}/cu130/vllm/"
@@ -120,6 +120,8 @@ def fetch_vllm(commit: str, destination: Path) -> None:
         for entry in entries
         if entry["package_name"] == "vllm"
         and entry["platform_tag"].endswith("_" + platform.machine())
+        # A release commit carries both the rc and the final wheel.
+        and (version is None or entry["version"] == version)
     ]
     if len(matches) != 1:
         raise RuntimeError(f"Expected one matching upstream wheel: {matches}")
@@ -186,7 +188,7 @@ if __name__ == "__main__":
     elif action == "compile-cache":
         compile_cache(args[0], Path(args[1]), Path(args[2]))
     elif action == "fetch-vllm":
-        fetch_vllm(args[0], Path(args[1]))
+        fetch_vllm(args[0], Path(args[1]), args[2] if len(args) > 2 else None)
     elif action == "inspect-vllm":
         inspect_vllm(Path(args[0]), Path(args[1]))
     else:

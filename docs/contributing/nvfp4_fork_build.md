@@ -1,18 +1,21 @@
-# NVFP4 fork build trial
+# Prime fork wheels
 
-The fork-only `nvfp4-wheels.yml` workflow builds on GitHub-hosted Ubuntu 24.04
-x86-64 CPUs. It does not deploy a service or publish a release/container.
-Pushes to `ci/nvfp4-wheels-20261001` run the trial; rerun an existing run from
+The fork-only `nvfp4-wheels.yml` workflow builds one vLLM wheel and one
+FlashInfer wheel per architecture (x86_64 for B300/H200, aarch64 for
+GB200/GB300) on GitHub-hosted Ubuntu 24.04 CPUs. Every production serving lane
+installs the same vLLM build. It does not deploy a service or publish a
+release/container. Pushes to `prime/v*` branches (e.g. `prime/v0.31.0`: the
+v0.31.0 release plus our production patches) run it; rerun an existing run from
 Actions or `gh run rerun`. Manual dispatch is declared, but GitHub requires
 the workflow to exist on the default branch before it appears in that UI.
 
 ## Outputs
 
-- `flashinfer-nvfp4-cu130-linux-x86_64`: FlashInfer source wheel containing the
+- `flashinfer-nvfp4-cu130-linux-<arch>`: FlashInfer source wheel containing the
   validated B300 kernel/planner changes and native JIT sources; separately
   compiled SM100a and SM103a libraries, build commands, hashes, and manifests.
-- `vllm-nvfp4-cu130-linux-x86_64`: vLLM's native-NVFP4 integration wheel, using
-  CUDA/Rust binaries from the exact upstream parent of this Python-only fork.
+- `vllm-prime-cu130-linux-<arch>`: vLLM's native-NVFP4 integration wheel, using
+  CUDA/Rust binaries from the pinned upstream release (`VLLM_BINARY_COMMIT`).
   The build refuses reuse if native sources or build configuration changed and
   verifies packaged native binaries against that upstream wheel.
 
@@ -38,7 +41,7 @@ uv pip install --python .venv-nvfp4/bin/python 'torch==2.13.0' \
   --index-url https://download.pytorch.org/whl/cu130
 uv pip install --python .venv-nvfp4/bin/python \
   nvfp4-build/flashinfer-nvfp4-cu130-linux-x86_64/flashinfer/*.whl \
-  nvfp4-build/vllm-nvfp4-cu130-linux-x86_64/*.whl
+  nvfp4-build/vllm-prime-cu130-linux-x86_64/*.whl
 ```
 
 Use a clean environment. The fork FlashInfer wheel has a local version suffix;
@@ -59,4 +62,4 @@ GitHub CPU builds cannot run the GPU correctness suite, CUDA graph replay,
 sanitizer, or latency measurements. Validate the downloaded wheel on B300 using
 the matching FlashInfer checkout's `tests/experimental/test_nvfp4_sparse_mla_decode.py`
 before using it in vLLM. SM100a compilation is not GB200 runtime validation,
-and these x86-64 binaries are not usable on an ARM64 GB200 host.
+and each architecture's artifacts only install on hosts of that architecture.
