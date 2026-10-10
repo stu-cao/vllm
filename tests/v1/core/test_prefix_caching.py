@@ -65,6 +65,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
@@ -4618,46 +4619,52 @@ def test_eagle_grouped_swa_siblings_use_same_cache_mask():
     assert num_computed_tokens == 8 * block_size
 
 
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("num_prompt_tokens", [165, 175])
-def test_eagle_swa_resend_hits_after_connector_import(num_prompt_tokens):
+def test_eagle_swa_resend_hits_after_connector_import(packed, num_prompt_tokens):
     """A prompt longer than the window, imported through a KV connector, must
     serve a resend from the prefix cache: the EAGLE sliding-window lookup needs
     one block below the window, which only the retained tail keeps allocated.
     175 tokens end one short of a block boundary, where the window's own
-    retention lands exactly on a block edge.
+    retention lands exactly on a block edge. A block-outermost layout (e.g.
+    BLHNC) wraps groups whose page sizes differ in UniformTypeKVCacheSpecs,
+    which the scheduler unwraps.
     """
     block_size = 16
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["swa_draft"],
-                SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=4 * block_size,
-                ),
-            ),
-        ],
-    )
-    # No group is flagged (e.g. a DFlash drafter), so both count as EAGLE.
-    kv_cache_utils._retain_eagle_hit_blocks_below_window(
-        SimpleNamespace(
-            speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True)
+    specs = {
+        "full": FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=2 if packed else 1,
+            dtype=torch.float32,
         ),
-        kv_cache_config.kv_cache_groups,
+        "swa_draft": SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=4 * block_size,
+        ),
+    }
+    # No group is flagged for a DFlash drafter, so both count as EAGLE.
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: SimpleNamespace(
+                is_block_outermost=packed
+            )
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=None)),
+        speculative_config=SimpleNamespace(
+            method="dflash", use_eagle=lambda: True, use_eagle_block_drop=lambda: True
+        ),
+    )
+    groups = kv_cache_utils.get_kv_cache_groups(config, specs)
+    wrapped = [isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in groups]
+    assert wrapped == [packed, packed]
+    kv_cache_utils._retain_eagle_hit_blocks_below_window(config, groups)
+    kv_cache_config = kv_cache_utils.generate_scheduler_kv_cache_config(
+        [KVCacheConfig(num_blocks=100, kv_cache_tensors=[], kv_cache_groups=groups)]
     )
     manager = make_kv_cache_manager(
         kv_cache_config,
