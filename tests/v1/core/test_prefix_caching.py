@@ -4670,7 +4670,10 @@ def test_eagle_swa_resend_hits_after_connector_import(num_prompt_tokens):
 
     token_ids = list(range(num_prompt_tokens))
     req0 = make_request("0", token_ids, block_size, sha256)
-    assert allocate_external_prefix(manager, req0, num_prompt_tokens) is not None
+    assert (
+        allocate_external_prefix(manager, req0, num_prompt_tokens, gpu_landing=False)
+        is not None
+    )
     # The scheduler caches the loaded blocks once the transfer lands.
     manager.cache_blocks(req0, num_prompt_tokens)
     manager.free(req0)
