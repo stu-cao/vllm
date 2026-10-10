@@ -586,6 +586,16 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         write_flashinfer_autotune_cache(cache_path, cached_results)
         world.barrier()
         tuner.load_configs(str(cache_path))
+        if envs.VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE:
+            # Outside a tuning pass FlashInfer serves tactics from the loaded
+            # file; inside one it re-profiles ops whose profiling policy is
+            # not the default, which the file cannot record.
+            if is_leader:
+                logger.info(
+                    "Reusing FlashInfer autotune cache %s; skipping the tuning pass.",
+                    cache_path,
+                )
+            return
 
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)

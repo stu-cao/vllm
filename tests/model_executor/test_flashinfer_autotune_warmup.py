@@ -11,6 +11,7 @@ import pytest
 from vllm.model_executor.warmup.kernel_warmup import (
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
+    flashinfer_autotune,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -125,3 +126,51 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
             **({"skip_attn": True} if skip_attn else {}),
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("reuse_cache", "cache_exists", "expect_tuning"),
+    [(True, True, False), (True, False, True), (False, True, True)],
+)
+def test_flashinfer_autotune_reuse_cache_skips_tuning_pass(
+    tmp_path, monkeypatch, reuse_cache, cache_exists, expect_tuning
+):
+    flashinfer_autotuner = pytest.importorskip("flashinfer.autotuner")
+    cache_path = tmp_path / "autotune.json"
+    if cache_exists:
+        cache_path.write_bytes(b"{}")
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE", str(int(reuse_cache)))
+    world = SimpleNamespace(
+        rank_in_group=0,
+        world_size=1,
+        cpu_group=None,
+        broadcast_object=lambda obj, src: obj,
+        barrier=Mock(),
+    )
+    tuner = Mock()
+    warmup = "vllm.model_executor.warmup.kernel_warmup."
+
+    with (
+        patch("vllm.distributed.parallel_state.get_world_group", return_value=world),
+        patch.object(flashinfer_autotuner.AutoTuner, "get", return_value=tuner),
+        patch.object(flashinfer_autotuner, "set_autotune_process_group"),
+        patch(warmup + "resolve_flashinfer_autotune_file", return_value=cache_path),
+        patch(warmup + "write_flashinfer_autotune_cache"),
+        patch(warmup + "_flashinfer_autotune_skip_ops", return_value=None),
+        patch(warmup + "_run_flashinfer_autotune_dummy_runs") as dummy_runs,
+        patch(warmup + "_run_flashinfer_bf16_autotune_dummy_run"),
+        patch(warmup + "replayssm_autotune_warmup"),
+        patch(warmup + "_autotune_kimi_k3_kda_qkvg"),
+        patch("vllm.utils.flashinfer.autotune"),
+    ):
+        runner = SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                attention_config=SimpleNamespace(hisparse_config=None)
+            ),
+            get_model=Mock(),
+        )
+        flashinfer_autotune(runner)
+
+    assert tuner.load_configs.called == cache_exists
+    assert dummy_runs.called == expect_tuning
+    assert tuner.save_configs.called == expect_tuning

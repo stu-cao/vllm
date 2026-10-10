@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_DISPATCH_ENABLE_PDL: bool | None = None
     VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS: bool = False
+    VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1792,6 +1793,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS", "0"))
     ),
+    # If set and the FlashInfer autotune cache file exists, load it and skip
+    # the boot tuning pass; kernels take their tactics from the file. While
+    # tuning, FlashInfer ignores persisted entries for ops that profile with a
+    # non-default replay/L2 policy (the NVFP4 MoE among them), so without this
+    # every boot re-profiles those ops. A shape missing from the file uses the
+    # heuristic fallback tactic. Off by default.
+    "VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE", "0"))
+    ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
@@ -2367,6 +2377,9 @@ def compile_factors() -> dict[str, object]:
         # Only adds autotune buckets to the (additive) autotune cache; keeping
         # it out of the hash lets enabling it reuse the existing cache file.
         "VLLM_FLASHINFER_AUTOTUNE_DP_PADDED_MOE_BUCKETS",
+        # Only decides whether the boot autotune pass runs; not part of any
+        # compiled graph.
+        "VLLM_FLASHINFER_AUTOTUNE_REUSE_CACHE",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
