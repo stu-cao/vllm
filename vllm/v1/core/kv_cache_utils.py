@@ -2258,6 +2258,46 @@ def _warn_if_unannotated_eagle_mamba(
     )
 
 
+def _retain_eagle_hit_blocks_below_window(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> None:
+    """Retain the whole blocks an EAGLE sliding-window cache hit scans.
+
+    An EAGLE group's hit needs ``cdiv(sliding_window - 1, block_size) + 1``
+    contiguous cached blocks ending at a block boundary (see
+    ``SlidingWindowManager._contiguous_blocks_for_hit``), one more than the
+    window spans. Widen ``extra_retained_tokens`` so that run stays allocated
+    below the window for every prompt length; otherwise a KV connector import
+    lands and hashes one block too few and no later request can hit. Mirrors
+    the coordinator: every group is an EAGLE group when none is flagged.
+
+    Args:
+        vllm_config: Config supplying the speculative method, if any.
+        kv_cache_groups: Groups to update in place.
+
+    """
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle_block_drop():
+        return
+    annotated = any(group.is_eagle_group for group in kv_cache_groups)
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if (
+            not isinstance(spec, SlidingWindowSpec)
+            or not spec.prefix_cacheable
+            or (annotated and not group.is_eagle_group)
+        ):
+            continue
+        hit_blocks = cdiv(spec.sliding_window - 1, spec.block_size) + 1
+        group.kv_cache_spec = replace(
+            spec,
+            extra_retained_tokens=spec.extra_retained_tokens
+            + hit_blocks * spec.block_size
+            - (spec.sliding_window - 1),
+        )
+
+
 def _largest_divisor_at_most(value: int, limit: int) -> int:
     for candidate in range(min(value, limit), 0, -1):
         if value % candidate == 0:
@@ -2746,6 +2786,7 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    _retain_eagle_hit_blocks_below_window(vllm_config, global_kv_cache_groups)
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
