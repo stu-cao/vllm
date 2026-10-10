@@ -2323,6 +2323,9 @@ def recv_worker():
     worker._handshake_futures = {}
     worker._remote_agents = {}
     worker._engine_by_address = {}
+    worker._unreachable_remote_engines = set()
+    worker._engine_heartbeat_interval = 0.0
+    worker._next_engine_heartbeat = 0.0
     worker._replicated_pcp_done_sending = set()
     worker._invalid_block_ids = queue.Queue()
     worker._pending_recv_notifs = {}

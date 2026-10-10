@@ -251,3 +251,68 @@ def test_reaper_reclaims_shorter_lease_behind_later_deadline(monkeypatch):
     assert done == {"Y"}
     assert list(w._reqs_to_send) == ["X"]
     assert w._reqs_to_process == {"X"}
+
+
+# ===================================================================
+# Worker: unreachable remote engines (failed UCX keepalive)
+# ===================================================================
+
+
+class nixlRemoteDisconnectError(Exception):  # noqa: N801 (NIXL's exception name)
+    pass
+
+
+def _pull_worker_stub(*, inflight: bool = False):
+    import threading
+
+    w = _worker_stub()
+    assert w._TRANSFER_MODE == "pull"
+    w._handshake_lock = threading.Lock()
+    w._handshake_futures = {}
+    w._remote_agents = {"prefill-a": {0: "agent-a"}, "prefill-b": {0: "agent-b"}}
+    w._unreachable_remote_engines = set()
+    w._engine_heartbeat_interval = 5.0
+    w._next_engine_heartbeat = 0.0
+    w._recving_transfers = {"req-1": []} if inflight else {}
+    w._recving_metadata = (
+        {"req-1": MagicMock(remote=MagicMock(engine_id="prefill-a"))}
+        if inflight
+        else {}
+    )
+    w.nixl_wrapper = MagicMock()
+
+    def send_notif(agent_name, notif_msg):
+        if agent_name == "agent-a":
+            raise nixlRemoteDisconnectError("peer gone")
+
+    w.nixl_wrapper.send_notif.side_effect = send_notif
+    w._cleanup_remote_engine = MagicMock()
+    return w
+
+
+def test_failed_heartbeat_releases_unreachable_engine():
+    w = _pull_worker_stub()
+    w._release_unreachable_remote_engines()
+
+    sent = {c.args[0] for c in w.nixl_wrapper.send_notif.call_args_list}
+    assert sent == {"agent-a", "agent-b"}
+    w._cleanup_remote_engine.assert_called_once_with("prefill-a", log_eviction=False)
+    assert w._unreachable_remote_engines == set()
+
+
+def test_unreachable_engine_kept_while_a_read_is_in_flight():
+    w = _pull_worker_stub(inflight=True)
+    w._release_unreachable_remote_engines()
+
+    w._cleanup_remote_engine.assert_not_called()
+    assert w._unreachable_remote_engines == {"prefill-a"}
+
+
+def test_engine_heartbeat_is_rate_limited(monkeypatch):
+    w = _pull_worker_stub()
+    w._remote_agents = {"prefill-b": {0: "agent-b"}}
+    monkeypatch.setattr(time, "perf_counter", lambda: 100.0)
+    w._heartbeat_remote_engines()
+    w._heartbeat_remote_engines()
+    assert w.nixl_wrapper.send_notif.call_count == 1
+    assert w._next_engine_heartbeat == 105.0

@@ -60,6 +60,9 @@ def region_pull_worker():
     worker._engine_last_active = {}
     worker._handshake_lock = threading.RLock()
     worker._handshake_futures = {}
+    worker._unreachable_remote_engines = set()
+    worker._engine_heartbeat_interval = 0.0
+    worker._next_engine_heartbeat = 0.0
     worker._transfer_layer_group_ids = ()
     worker._bidirectional_kv_xfer_enabled = False
     worker._recving_transfers = {}
