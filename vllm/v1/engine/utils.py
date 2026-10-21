@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import signal
 import threading
 import weakref
 from collections.abc import Callable, Iterator, Sequence
@@ -41,6 +42,67 @@ logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
 ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
+
+# Signals we expect to see behind a negative multiprocessing exit code, spelled
+# out so the log line does not depend on the platform's signal numbering.
+_COMMON_SIGNAL_NAMES: dict[int, str] = {
+    int(signal.SIGABRT): "SIGABRT",
+    int(signal.SIGBUS): "SIGBUS",
+    int(signal.SIGFPE): "SIGFPE",
+    int(signal.SIGILL): "SIGILL",
+    int(signal.SIGINT): "SIGINT",
+    int(signal.SIGKILL): "SIGKILL",
+    int(signal.SIGPIPE): "SIGPIPE",
+    int(signal.SIGQUIT): "SIGQUIT",
+    int(signal.SIGSEGV): "SIGSEGV",
+    int(signal.SIGTERM): "SIGTERM",
+}
+
+
+def _signal_name(signum: int) -> str:
+    name = _COMMON_SIGNAL_NAMES.get(signum)
+    if name is not None:
+        return name
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return "unnamed signal"
+
+
+def describe_exitcode(exitcode: int | None) -> str:
+    """Render a multiprocessing exit code as a self-describing string.
+
+    A process that returns from ``main`` reports its own status (0 or
+    positive). A process killed by a signal reports ``-signum``, which on its
+    own is indistinguishable from a crash: -9 is a SIGKILL (OOM killer,
+    watchdog, external ``kill -9``), -15 a SIGTERM, -11 a segfault. Decoding
+    it is the difference between "the engine exited" and "something killed the
+    engine with SIGKILL".
+
+    Args:
+        exitcode: The value of ``BaseProcess.exitcode``.
+
+    Returns:
+        A string such as ``"-9 (killed by SIGKILL, signal 9)"``.
+
+    """
+    if exitcode is None:
+        return "exit code unknown (process state not collected)"
+    if exitcode < 0:
+        signum = -exitcode
+        return f"{exitcode} (killed by {_signal_name(signum)}, signal {signum})"
+    if exitcode == 0:
+        return "0 (clean exit)"
+    return f"{exitcode} (self-reported exit status {exitcode})"
+
+
+def _describe_actor_error(error: BaseException, limit: int = 500) -> str:
+    """Collapse a Ray actor error into a single, bounded log line."""
+    message = str(error).strip()
+    if not message:
+        return "<no message>"
+    first_line = message.splitlines()[0]
+    return first_line if len(first_line) <= limit else first_line[:limit] + "..."
 
 
 def get_engine_process_shutdown_timeout(
@@ -290,6 +352,30 @@ class CoreEngineProcManager:
                 )
             shutdown(self.processes, timeout=process_timeout)
 
+    def _log_process_exit(self, proc: BaseProcess, exitcode: int | None) -> None:
+        """Log how an engine core process died, and whether it was expected.
+
+        Logged before ``shutdown()`` so that an unexpected death is always
+        recorded with its exit code: a silent death that only leaves
+        ``exitcode != 0`` behind is undiagnosable after the fact.
+        """
+        if exitcode == 0:
+            return
+        manager_stopped = self.manager_stopped.is_set()
+        # A non-zero exit while we are shutting down is expected: the process
+        # was most likely killed by our own shutdown path. Distinguish the two
+        # cases so a killed-by-us SIGTERM is not reported as a crash.
+        log = logger.warning if manager_stopped else logger.error
+        log(
+            "Engine core process %s (pid %s) exited with %s. "
+            "manager_stopped=%s (expected shutdown: %s)",
+            proc.name,
+            proc.pid,
+            describe_exitcode(exitcode),
+            manager_stopped,
+            manager_stopped,
+        )
+
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
@@ -301,6 +387,7 @@ class CoreEngineProcManager:
             for sentinel in died_sentinels:
                 proc = sentinel_to_proc.pop(cast(int, sentinel))
                 exitcode = proc.exitcode
+                self._log_process_exit(proc, exitcode)
                 if exitcode != 0 and not self.manager_stopped.is_set():
                     self.failed_proc_name = proc.name
             if died_sentinels:
@@ -1045,9 +1132,20 @@ class CoreEngineActorManager:
                     continue
                 try:
                     ray.get(actor_ref)
-                except ray.exceptions.RayActorError:
+                except ray.exceptions.RayActorError as e:
                     self.failed_proc_name = f"Actor {actor_ref}"
                     unexpected_failure = True
+                    manager_stopped = self.manager_stopped.is_set()
+                    log = logger.warning if manager_stopped else logger.error
+                    log(
+                        "Engine core actor %s exited with %s: %s. "
+                        "manager_stopped=%s (expected shutdown: %s)",
+                        actor_ref,
+                        type(e).__name__,
+                        _describe_actor_error(e),
+                        manager_stopped,
+                        manager_stopped,
+                    )
 
             if unexpected_failure:
                 break

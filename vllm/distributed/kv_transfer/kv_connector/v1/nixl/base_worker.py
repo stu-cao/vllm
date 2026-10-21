@@ -24,6 +24,7 @@ import regex as re
 import torch
 import zmq
 
+from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
@@ -39,6 +40,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.errors import (
+    KVTransferFailureKind,
+    KVTransferFatalError,
+    classify_transfer_failure,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
     NixlAgentMetadata,
@@ -1016,6 +1022,10 @@ class NixlBaseConnectorWorker:
         self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
         self.xfer_stats = NixlKVConnectorStats()
 
+        # Set when a transfer failed because this process's CUDA context is
+        # poisoned. Only a restart clears it; see `errors.py`.
+        self._fatal_context_error: str | None = None
+
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
 
@@ -1409,6 +1419,58 @@ class NixlBaseConnectorWorker:
             context,
             exc_info=error is not None,
             stacklevel=2,
+        )
+        self._record_fatal_context_failure(error, req_id)
+
+    def _record_fatal_context_failure(
+        self, error: BaseException | str | None, req_id: str | None
+    ) -> None:
+        """Remember that this engine's CUDA context is poisoned.
+
+        Called for every transfer failure. Only the first hard failure logs
+        and latches the state, so a poisoned engine with requests in flight
+        produces one error line instead of one per request.
+        """
+        if self._fatal_context_error is not None:
+            return
+        if (
+            classify_transfer_failure(error)
+            is not KVTransferFailureKind.FATAL_CUDA_CONTEXT
+        ):
+            return
+        self._fatal_context_error = (
+            error if isinstance(error, str) else str(error)
+        ) or "<no message>"
+        logger.error(
+            "NIXL transfer failed with a poisoned CUDA context (request %r): %s. "
+            "This engine can no longer serve KV transfers: a new CUDA context "
+            "is required, which only a process restart provides.",
+            req_id,
+            self._fatal_context_error,
+        )
+
+    def _raise_if_cuda_context_poisoned(self) -> None:
+        """Abort the engine when its CUDA context is known to be poisoned.
+
+        Raises:
+            KVTransferFatalError: This worker observed a hard CUDA failure, so
+                every later transfer would fail too. Propagating out of the
+                model runner aborts the EngineCore; a dead engine fails its
+                readiness probe and stops receiving traffic, while a Ready
+                engine with a poisoned context absorbs requests it can never
+                serve.
+
+        """
+        if self._fatal_context_error is None:
+            return
+        if not envs.VLLM_KV_CONNECTOR_FAIL_FAST_ON_CUDA_CONTEXT_ERROR:
+            return
+        raise KVTransferFatalError(
+            "KV transfer failed with a poisoned CUDA context: "
+            f"{self._fatal_context_error}. Aborting the engine instead of "
+            "serving requests it cannot complete. Set "
+            "VLLM_KV_CONNECTOR_FAIL_FAST_ON_CUDA_CONTEXT_ERROR=0 to keep the "
+            "engine alive and fail transfers per request."
         )
 
     def _ensure_handshake(
@@ -3397,6 +3459,12 @@ class NixlBaseConnectorWorker:
 
         self._cleanup_replaced_remote_engines()
         self._release_unreachable_remote_engines()
+
+        # Last, after every failure is recorded and every peer released: a
+        # poisoned CUDA context makes all later transfers fail, so this is the
+        # point where serving on is worse than stopping the engine.
+        self._raise_if_cuda_context_poisoned()
+
         return KVConnectorTransferResults(
             finished_sending=done_sending,
             finished_recving=done_recving,

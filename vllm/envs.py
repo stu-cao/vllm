@@ -285,6 +285,7 @@ if TYPE_CHECKING:
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
+    VLLM_KV_CONNECTOR_FAIL_FAST_ON_CUDA_CONTEXT_ERROR: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_DEEPEP_BUFFER_SIZE_MB: int = 1024
     VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE: bool = False
@@ -2007,6 +2008,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # raw bytes. Defaults to True for backward compatibility.
     "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": lambda: bool(
         int(os.getenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "1"))
+    ),
+    # Exit the engine when a KV transfer fails because the CUDA context is
+    # poisoned (e.g. an NVLink/MNNVL channel reset revoked a NIXL importer).
+    # A restarted engine fails its readiness probe and stops receiving
+    # traffic; a poisoned engine stays Ready and fails every request.
+    # Set to 0 to keep the engine alive and let the per-request failure
+    # policy handle poisoned transfers.
+    "VLLM_KV_CONNECTOR_FAIL_FAST_ON_CUDA_CONTEXT_ERROR": lambda: bool(
+        int(os.getenv("VLLM_KV_CONNECTOR_FAIL_FAST_ON_CUDA_CONTEXT_ERROR", "1"))
     ),
     # Name of the shared memory buffer used for object storage.
     # Only effective when mm_config.mm_processor_cache_type == "shm".
